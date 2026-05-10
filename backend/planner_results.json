@@ -1,0 +1,71 @@
+{
+  "Test 1 (Frontend Internship)": {
+    "skills_to_test": [
+      "React",
+      "JavaScript"
+    ],
+    "topic_order": [
+      "State Management",
+      "API Integration",
+      "Error Handling"
+    ],
+    "resume_projects_to_probe": [
+      "E-commerce Dashboard",
+      "Chat Application"
+    ],
+    "behavioral_focus": [
+      "Problem-solving",
+      "Communication"
+    ],
+    "difficulty_strategy": {
+      "start": "easy",
+      "middle": "medium",
+      "end": "medium"
+    }
+  },
+  "Test 2 (HR Interview)": {
+    "skills_to_test": [
+      "Communication",
+      "Teamwork"
+    ],
+    "topic_order": [
+      "Sales",
+      "Communication Skills"
+    ],
+    "resume_projects_to_probe": [],
+    "behavioral_focus": [
+      "Conflict Handling",
+      "Motivation",
+      "Strengths/Weaknesses"
+    ],
+    "difficulty_strategy": {
+      "start": "easy",
+      "middle": "easy",
+      "end": "easy"
+    }
+  },
+  "Test 3 (Hard Backend)": {
+    "skills_to_test": [
+      "FastAPI",
+      "PostgreSQL",
+      "Python",
+      "Redis"
+    ],
+    "topic_order": [
+      "Scalable Architecture",
+      "Performance Optimization",
+      "Database Tuning",
+      "Async Systems"
+    ],
+    "resume_projects_to_probe": [],
+    "behavioral_focus": [
+      "Problem Solving",
+      "Communication"
+    ],
+    "difficulty_strategy": {
+      "start": "medium",
+      "middle": "hard",
+      "end": "hard"
+    }
+  }
+}
