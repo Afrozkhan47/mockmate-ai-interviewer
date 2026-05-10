@@ -62,3 +62,6 @@ lint_results_3.txt
 backend/server.log
 backend/serverDetail.log
 *.log
+
+# Gemini local testing
+backend/test_gemini_key.py
