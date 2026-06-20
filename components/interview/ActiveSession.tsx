@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { Mic, MicOff, Video, VideoOff, PhoneOff, Maximize2, Minimize2 } from "lucide-react";
 import { speechManager } from "@/services/speechManager";
+import { sttManager } from "@/services/sttManager";
 
 interface ActiveSessionProps {
     config: InterviewConfig;
@@ -18,6 +19,7 @@ export function ActiveSession({ config, initialSessionId, initialQuestion }: Act
     const [timeLeft, setTimeLeft] = useState(config.duration * 60);
     const isLowTime = timeLeft <= 60;
     const [isCompleted, setIsCompleted] = useState(false);
+    const [isSummaryReady, setIsSummaryReady] = useState(false);
     const [isSessionError, setIsSessionError] = useState(false);
 
     const [sessionId, setSessionId] = useState<string>(initialSessionId);
@@ -33,14 +35,58 @@ export function ActiveSession({ config, initialSessionId, initialQuestion }: Act
     const [isThinking, setIsThinking] = useState(false);
     const [isSpeaking, setIsSpeaking] = useState(false);
 
+    // Dictation State
+    const [isDictating, setIsDictating] = useState(false);
+    const [interimText, setInterimText] = useState("");
+
     // Media State
     const videoRef = useRef<HTMLVideoElement>(null);
+    const inputRef = useRef<HTMLInputElement>(null);
     const [stream, setStream] = useState<MediaStream | null>(null);
     const [micEnabled, setMicEnabled] = useState(true);
     const [cameraEnabled, setCameraEnabled] = useState(true);
     const [isFullscreen, setIsFullscreen] = useState(false);
 
     const isFinalizingRef = useRef(false);
+    const isInitialMount = useRef(true);
+
+    // Clean up STT on unmount
+    useEffect(() => {
+        return () => {
+            sttManager.stopListening();
+        };
+    }, []);
+
+    const toggleDictation = () => {
+        if (isDictating) {
+            sttManager.stopListening();
+        } else {
+            sttManager.startListening(
+                (interim, final) => {
+                    setInterimText(interim);
+                    if (final) {
+                        setAnswer(prev => (prev + " " + final).trim());
+                    }
+                },
+                (listening) => {
+                    setIsDictating(listening);
+                    if (!listening) setInterimText("");
+                },
+                (err) => {
+                    console.error("STT Error:", err);
+                    setIsDictating(false);
+                    setInterimText("");
+                }
+            );
+        }
+    };
+
+    // Auto-scroll input when dictating
+    useEffect(() => {
+        if (isDictating && inputRef.current) {
+            inputRef.current.scrollLeft = inputRef.current.scrollWidth;
+        }
+    }, [interimText, answer, isDictating]);
 
     // Initialize Webcam
     useEffect(() => {
@@ -70,13 +116,69 @@ export function ActiveSession({ config, initialSessionId, initialQuestion }: Act
         };
     }, []);
 
-    // Toggle Camera Track
+    // Toggle Mic Track
     useEffect(() => {
         if (stream) {
-            stream.getVideoTracks().forEach(track => {
-                track.enabled = cameraEnabled;
+            stream.getAudioTracks().forEach(track => {
+                track.enabled = micEnabled;
             });
         }
+    }, [micEnabled, stream]);
+
+    // Toggle Camera Track
+    useEffect(() => {
+        let mounted = true;
+
+        const toggleCamera = async () => {
+            if (isInitialMount.current) {
+                isInitialMount.current = false;
+                return; // Skip turning off/on during the very first render cycle
+            }
+
+            if (!cameraEnabled) {
+                // Turn OFF: completely stop and remove video tracks to release hardware
+                if (stream) {
+                    stream.getVideoTracks().forEach(track => {
+                        track.stop();
+                        stream.removeTrack(track);
+                    });
+                    if (videoRef.current) {
+                        videoRef.current.srcObject = null; // Clear to prevent frozen frame
+                    }
+                }
+            } else {
+                // Turn ON: request a fresh video stream
+                try {
+                    const newVideoStream = await navigator.mediaDevices.getUserMedia({ video: true });
+                    if (!mounted) {
+                        newVideoStream.getTracks().forEach(t => t.stop());
+                        return;
+                    }
+                    
+                    if (stream) {
+                        // Append the new track to the existing stream
+                        const newVideoTrack = newVideoStream.getVideoTracks()[0];
+                        stream.addTrack(newVideoTrack);
+                        
+                        if (videoRef.current) {
+                            // Rebind the entire stream
+                            videoRef.current.srcObject = stream;
+                            // Attempt to play if it was paused
+                            await videoRef.current.play().catch(e => console.error("Playback failed:", e));
+                        }
+                    }
+                } catch (err) {
+                    console.error("Failed to re-enable camera", err);
+                    if (mounted) setCameraEnabled(false);
+                }
+            }
+        };
+
+        toggleCamera();
+        
+        return () => {
+            mounted = false;
+        };
     }, [cameraEnabled, stream]);
 
     // Fullscreen handling
@@ -95,6 +197,11 @@ export function ActiveSession({ config, initialSessionId, initialQuestion }: Act
         setIsFetching(true);
         setTransitionStatus('submitting');
         setIsSessionError(false);
+        
+        // Start thinking state immediately to mask latency
+        setIsThinking(true); 
+        const fetchStartTime = Date.now();
+
         try {
             const response = await fetch("/api/answer", {
                 method: "POST",
@@ -114,10 +221,38 @@ export function ActiveSession({ config, initialSessionId, initialQuestion }: Act
             setInterviewState(data.state);
 
             if (data.is_final) {
-                handleComplete(false);
+                // Play final emotional closure
+                const closingPhrase = "That concludes our interview today. Thank you for taking the time to speak with me.";
+                setIsThinking(false);
+                setCurrentQuestion(closingPhrase);
+                setIsSpeaking(true);
+                
+                await speechManager.playSpeech(
+                    closingPhrase,
+                    () => {},
+                    () => {
+                        setIsSpeaking(false);
+                        setTransitionStatus('idle');
+                        handleComplete(false);
+                    },
+                    (err) => {
+                        console.error("Speech Manager Error:", err);
+                        setIsSpeaking(false);
+                        setTransitionStatus('idle');
+                        handleComplete(false);
+                    }
+                );
             } else {
-                // MASK LATENCY: TTS generation delay is hidden by the Thinking state
-                setIsThinking(true);
+                // Calculate required dynamic delay (based on answer length)
+                const fetchDuration = Date.now() - fetchStartTime;
+                // ~500ms for short answers, ~900ms for medium, ~1800ms for deep answers
+                // Multiplying string length by 4 gives a reasonable spread (e.g. 100 chars -> 400ms)
+                const idealDelay = Math.max(500, Math.min(1800, answerText.length * 4));
+                const remainingDelay = idealDelay - fetchDuration;
+                
+                if (remainingDelay > 0) {
+                    await new Promise(resolve => setTimeout(resolve, remainingDelay));
+                }
                 
                 await speechManager.playSpeech(
                     data.question,
@@ -147,8 +282,10 @@ export function ActiveSession({ config, initialSessionId, initialQuestion }: Act
                 setDisplayedQuestion("The interview session was interrupted. Please restart the interview.");
                 setTransitionStatus('idle');
             }
+            setIsThinking(false);
         } finally {
             setIsFetching(false);
+            setAnswer(""); // Clear the input field after sending
         }
     };
 
@@ -253,12 +390,13 @@ export function ActiveSession({ config, initialSessionId, initialQuestion }: Act
         await submitAnswer(answer);
     };
 
-    const handleComplete = async (finalizeBackend = false) => {
+    const handleComplete = async (manualExit = false) => {
         if (isFinalizingRef.current) return;
         isFinalizingRef.current = true;
         setIsCompleted(true);
         
         speechManager.stop();
+        sttManager.stopListening();
         
         if (stream) {
             stream.getTracks().forEach(t => t.stop());
@@ -267,45 +405,87 @@ export function ActiveSession({ config, initialSessionId, initialQuestion }: Act
             document.exitFullscreen();
         }
 
-        if (finalizeBackend && sessionId) {
+        if (manualExit && sessionId) {
             try {
-                if (isFetching) {
-                    let waitCount = 0;
-                    while (isFetching && waitCount < 30) {
-                        await new Promise(resolve => setTimeout(resolve, 100));
-                        waitCount++;
-                    }
-                }
                 await fetch(`/api/interviews/${sessionId}/end`, { method: "POST" });
             } catch (e) {
                 console.error("Failed to finalize session:", e);
             }
+            router.push(`/dashboard?session_id=${sessionId}`);
+            return;
         }
 
+        // Wait for summary (fake latency mask for backend process)
         setTimeout(() => {
-            if (sessionId) router.push(`/dashboard?session_id=${sessionId}`);
-            else router.push('/dashboard');
-        }, 3000);
+            setIsSummaryReady(true);
+            
+            // Auto redirect fallback after 10 seconds
+            setTimeout(() => {
+                if (sessionId) router.push(`/dashboard?session_id=${sessionId}`);
+                else router.push('/dashboard');
+            }, 10000);
+        }, 4000);
     };
 
     if (isCompleted) {
         return (
             <div className="fixed inset-0 min-h-screen bg-zinc-950 flex items-center justify-center p-6 font-sans">
-                <motion.div 
-                    initial={{ opacity: 0, scale: 0.95 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    className="bg-zinc-900/80 backdrop-blur-xl border border-white/10 max-w-2xl w-full p-12 rounded-[24px] shadow-2xl text-center space-y-8"
-                >
-                    <div className="w-24 h-24 bg-green-500/20 rounded-full flex items-center justify-center mx-auto text-green-400 border border-green-500/30">
-                        <svg className="w-12 h-12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" /></svg>
-                    </div>
-                    <div className="space-y-4">
-                        <h2 className="text-4xl font-light tracking-wide text-white">Interview Concluded</h2>
-                        <p className="text-zinc-400 text-lg leading-relaxed font-medium">
-                            Compiling your performance summary and analyzing feedback...
-                        </p>
-                    </div>
-                </motion.div>
+                {/* Ambient Background Glow */}
+                <div className="absolute inset-0 pointer-events-none bg-[radial-gradient(circle_at_50%_50%,rgba(59,38,103,0.15)_0%,rgba(0,0,0,0)_60%)]" />
+                
+                <AnimatePresence mode="wait">
+                    {!isSummaryReady ? (
+                        <motion.div 
+                            key="generating"
+                            initial={{ opacity: 0, scale: 0.95 }}
+                            animate={{ opacity: 1, scale: 1 }}
+                            exit={{ opacity: 0, scale: 1.05 }}
+                            transition={{ duration: 0.5 }}
+                            className="relative z-10 text-center space-y-8"
+                        >
+                            <div className="flex space-x-3 justify-center mb-6">
+                                <motion.div animate={{ scale: [1, 1.2, 1] }} transition={{ repeat: Infinity, duration: 1 }} className="w-3 h-3 rounded-full bg-violet-500" />
+                                <motion.div animate={{ scale: [1, 1.2, 1] }} transition={{ repeat: Infinity, duration: 1, delay: 0.2 }} className="w-3 h-3 rounded-full bg-violet-400" />
+                                <motion.div animate={{ scale: [1, 1.2, 1] }} transition={{ repeat: Infinity, duration: 1, delay: 0.4 }} className="w-3 h-3 rounded-full bg-violet-300" />
+                            </div>
+                            <h2 className="text-3xl font-light tracking-wide text-white">Generating Interview Summary</h2>
+                            <p className="text-zinc-400 text-lg leading-relaxed font-medium">
+                                Compiling your performance and analyzing feedback...
+                            </p>
+                        </motion.div>
+                    ) : (
+                        <motion.div 
+                            key="ready"
+                            initial={{ opacity: 0, scale: 0.95, y: 20 }}
+                            animate={{ opacity: 1, scale: 1, y: 0 }}
+                            className="bg-zinc-900/80 backdrop-blur-xl border border-white/10 max-w-2xl w-full p-12 rounded-[24px] shadow-2xl text-center space-y-8 relative z-10"
+                        >
+                            <div className="w-24 h-24 bg-green-500/10 rounded-full flex items-center justify-center mx-auto text-green-400 border border-green-500/20 shadow-[0_0_30px_rgba(34,197,94,0.15)]">
+                                <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
+                            </div>
+                            <div className="space-y-4">
+                                <h2 className="text-4xl font-light tracking-wide text-white">Summary Ready</h2>
+                                <p className="text-zinc-400 text-lg leading-relaxed font-medium max-w-lg mx-auto">
+                                    Your interview has concluded successfully. You can now review your detailed feedback.
+                                </p>
+                            </div>
+                            <div className="flex flex-col sm:flex-row items-center justify-center space-y-4 sm:space-y-0 sm:space-x-6 pt-6">
+                                <button
+                                    onClick={() => router.push(`/dashboard?session_id=${sessionId}`)}
+                                    className="w-full sm:w-auto px-8 py-3.5 bg-white text-black hover:bg-zinc-200 rounded-xl font-semibold tracking-wide transition-all shadow-[0_0_20px_rgba(255,255,255,0.1)]"
+                                >
+                                    View Dashboard
+                                </button>
+                                <button
+                                    onClick={() => router.push('/')}
+                                    className="w-full sm:w-auto px-8 py-3.5 bg-white/5 hover:bg-white/10 text-white rounded-xl font-medium tracking-wide transition-all border border-white/10"
+                                >
+                                    Return Home
+                                </button>
+                            </div>
+                        </motion.div>
+                    )}
+                </AnimatePresence>
             </div>
         );
     }
@@ -323,7 +503,9 @@ export function ActiveSession({ config, initialSessionId, initialQuestion }: Act
                         <span className="font-medium text-sm tracking-widest uppercase text-zinc-300">REC</span>
                     </div>
                     <div className="hidden md:flex items-center space-x-4 border-l border-white/10 pl-6">
-                        <span className="text-sm font-medium text-white">{config.jobDescription.split('\\n')[0].substring(0, 30) || "Interview"}</span>
+                        <span className="text-sm font-medium text-white max-w-[140px] lg:max-w-[250px] truncate block" title={config.jobDescription.split('\n')[0]}>
+                            {config.jobDescription.split('\n')[0] || "Interview"}
+                        </span>
                         <span className="text-zinc-600">•</span>
                         <span className="text-sm text-zinc-400">{config.type}</span>
                     </div>
@@ -340,10 +522,10 @@ export function ActiveSession({ config, initialSessionId, initialQuestion }: Act
             <main className="flex-1 flex flex-col relative z-10 px-4 md:px-8 pt-6 pb-24">
                 
                 {/* SPLIT SCREEN VIDEO AREA */}
-                <div className="w-full flex-1 max-h-[50vh] grid grid-cols-1 lg:grid-cols-12 gap-6 relative">
+                <div className="w-full flex-1 max-h-[50vh] grid grid-cols-1 lg:grid-cols-12 gap-8 relative">
                     
-                    {/* LEFT PANEL: INTERVIEWER (Dominant) */}
-                    <div className="lg:col-span-8 relative rounded-3xl overflow-hidden bg-black/40 border border-white/5 shadow-2xl flex items-center justify-center">
+                    {/* LEFT PANEL: INTERVIEWER (Balanced Primary) */}
+                    <div className="lg:col-span-7 relative rounded-3xl overflow-hidden bg-black/40 border border-white/5 shadow-2xl flex items-center justify-center">
                         <AnimatePresence>
                             {isThinking && (
                                 <motion.div 
@@ -381,15 +563,15 @@ export function ActiveSession({ config, initialSessionId, initialQuestion }: Act
                         </div>
                     </div>
 
-                    {/* RIGHT PANEL: CANDIDATE */}
-                    <div className="lg:col-span-4 relative rounded-3xl overflow-hidden bg-black/60 border border-white/5 shadow-2xl flex items-center justify-center">
+                    {/* RIGHT PANEL: CANDIDATE (Balanced Secondary) */}
+                    <div className="lg:col-span-5 relative rounded-3xl overflow-hidden bg-black/60 border border-white/5 shadow-2xl flex items-center justify-center">
                         {cameraEnabled ? (
                             <video 
                                 ref={videoRef} 
                                 autoPlay 
                                 playsInline 
                                 muted 
-                                className="w-full h-full object-cover transform -scale-x-100"
+                                className="w-full h-full object-cover transform -scale-x-100 absolute inset-0"
                             />
                         ) : (
                             <div className="w-24 h-24 rounded-full bg-zinc-800 flex items-center justify-center">
@@ -406,11 +588,11 @@ export function ActiveSession({ config, initialSessionId, initialQuestion }: Act
                 </div>
 
                 {/* CINEMATIC QUESTION OVERLAY */}
-                <div className="flex-1 flex flex-col justify-center items-center mt-8 px-4 max-w-5xl mx-auto w-full">
+                <div className="flex-1 flex flex-col justify-center items-center mt-8 px-4 max-w-3xl mx-auto w-full">
                     <motion.p 
                         key={displayedQuestion} // Forces re-render animation if needed, but typing effect handles it
-                        className={`text-2xl md:text-4xl text-center leading-[1.4] font-light tracking-wide text-white drop-shadow-2xl transition-opacity duration-300 ${isSessionError ? 'text-red-400' : ''}`}
-                        style={{ textShadow: "0 4px 20px rgba(0,0,0,0.8)" }}
+                        className={`text-lg md:text-2xl text-center leading-relaxed font-light tracking-wide text-white/95 drop-shadow-2xl transition-opacity duration-300 ${isSessionError ? 'text-red-400' : ''}`}
+                        style={{ textShadow: "0 4px 20px rgba(0,0,0,0.9)" }}
                     >
                         {displayedQuestion}
                     </motion.p>
@@ -438,21 +620,41 @@ export function ActiveSession({ config, initialSessionId, initialQuestion }: Act
                     </div>
 
                     {/* Chat Input */}
-                    <div className="flex-1 relative">
+                    <div className="flex-1 relative flex items-center bg-white/5 border border-white/10 rounded-xl focus-within:ring-1 focus-within:ring-violet-500/50 hover:bg-white/10 transition-all duration-300">
                         <input
+                            ref={inputRef}
                             type="text"
-                            value={answer}
-                            onChange={(e) => setAnswer(e.target.value)}
+                            value={isDictating && interimText ? `${answer} ${interimText}` : answer}
+                            onChange={(e) => {
+                                if (!isDictating) setAnswer(e.target.value);
+                            }}
                             onKeyDown={(e) => {
-                                if (e.key === 'Enter' && !isTyping && !isFetching) {
+                                if (e.key === 'Enter' && !isTyping && !isFetching && !isThinking) {
+                                    if (isDictating) sttManager.stopListening();
                                     handleNext();
                                 }
                             }}
                             disabled={isTyping || isFetching || isThinking}
-                            placeholder={isTyping ? "Listen to the interviewer..." : "Type your response here and press Enter..."}
-                            className="w-full bg-white/5 border border-white/10 rounded-xl px-5 py-3 text-white placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-violet-500/50 transition-all disabled:opacity-50"
+                            placeholder={
+                                isTyping ? "Listen to the interviewer..." : 
+                                isDictating ? "Listening..." : "Type or speak your response here and press Enter..."
+                            }
+                            className={`w-full bg-transparent px-5 py-3 text-white placeholder:text-zinc-500 focus:outline-none disabled:opacity-50 ${isDictating ? 'text-violet-200' : ''}`}
                             autoFocus
                         />
+                        {sttManager.isSupported() && (
+                            <button
+                                onClick={toggleDictation}
+                                disabled={isTyping || isFetching || isThinking}
+                                className={`absolute right-2 p-2 rounded-lg transition-all ${
+                                    isDictating 
+                                        ? 'bg-violet-500/20 text-violet-400 animate-pulse' 
+                                        : 'text-zinc-400 hover:text-white hover:bg-white/10'
+                                } disabled:opacity-50`}
+                            >
+                                <Mic size={18} />
+                            </button>
+                        )}
                     </div>
 
                     {/* Utility & Leave */}

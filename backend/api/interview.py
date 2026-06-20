@@ -188,6 +188,14 @@ def _calculate_next_state(session: InterviewSession) -> InterviewState:
             
     return current
 
+def _map_state_to_stage(state: InterviewState) -> str:
+    if state in [InterviewState.WARM_UP, InterviewState.CONTEXT_ALIGNMENT]:
+        return "Stage 1 - Warmup"
+    elif state == InterviewState.DEPTH_EVALUATION:
+        return "Stage 2 - Intermediate"
+    else:
+        return "Stage 3 - Advanced"
+
 def _generate_authoritative_prompt(session: InterviewSession, system_prompt: str, memory_context: str = "") -> str:
     elapsed_time = time.time() - session.start_timestamp
     total_time_seconds = session.total_duration_minutes * 60
@@ -393,7 +401,10 @@ async def start_interview(
             candidate_answer="",
             evaluation_results=None,
             difficulty=session.difficulty,
-            is_follow_up=False
+            is_follow_up=False,
+            domain_type=session.plan.domain_type if session.plan else "General",
+            role_seniority=session.plan.role_seniority if session.plan else "General",
+            interview_stage=_map_state_to_stage(session.current_state)
         )
     except Exception as e:
         print(f"WARNING: LLM unavailable during /start for {session_id}: {e}. Using fallback question.")
@@ -567,7 +578,10 @@ async def answer_question(
             candidate_answer=request.answer,
             evaluation_results=eval_dict,
             difficulty=session.difficulty,
-            is_follow_up=is_follow_up
+            is_follow_up=is_follow_up,
+            domain_type=session.plan.domain_type if session.plan else "General",
+            role_seniority=session.plan.role_seniority if session.plan else "General",
+            interview_stage=_map_state_to_stage(session.current_state)
         )
 
     except Exception as e:

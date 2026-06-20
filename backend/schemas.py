@@ -92,6 +92,8 @@ class AnswerEvaluation(BaseModel):
     reasoning: str
 
 class InterviewPlan(BaseModel):
+    domain_type: str
+    role_seniority: str
     skills_to_test: List[str]
     topic_order: List[str]
     resume_projects_to_probe: List[str]

@@ -48,6 +48,8 @@ async def generate_interview_plan(
 
 def _fallback_plan() -> Dict[str, Any]:
     return {
+        "domain_type": "General",
+        "role_seniority": "General",
         "skills_to_test": ["Core Fundamentals"],
         "topic_order": ["Introduction", "Experience", "Technical Concepts", "Closing"],
         "resume_projects_to_probe": ["Past Experience"],
